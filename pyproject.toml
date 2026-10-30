@@ -1,0 +1,23 @@
+[project]
+name = "pymanakin"
+version = "0.1.0"
+description = "pydoll browser sessions seeded from your real browser profile, so automation starts out logged in."
+readme = "README.md"
+authors = [
+    { name = "Victor Condino", email = "un1tz3r0@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "browserprofile @ git+https://github.com/un1tz3r0/browserprofile",
+    "pydoll-python @ git+https://github.com/autoscrape-labs/pydoll",
+]
+
+[project.scripts]
+pymanakin = "pymanakin:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
