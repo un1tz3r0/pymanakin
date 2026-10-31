@@ -8,7 +8,7 @@ authors = [
 ]
 requires-python = ">=3.14"
 dependencies = [
-    "browserprofile @ git+https://github.com/un1tz3r0/browserprofile@5c01a990e255ca523a2b9d4890ba62bf0b132b28",
+    "browserprofile @ git+https://github.com/un1tz3r0/browserprofile",
     "pydoll-python @ git+https://github.com/autoscrape-labs/pydoll",
 ]
 
