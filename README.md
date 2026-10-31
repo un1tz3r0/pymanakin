@@ -27,6 +27,36 @@ asyncio.run(main())
 `options=` for pydoll's `ChromiumOptions` and `keyring=` to force a Linux keyring
 backend (see the browserprofile README).
 
+### Saved passwords
+
+Chrome won't autofill a password injected from outside, so `ProfiledChrome` does
+the autofilling itself: on a login page, it types a saved login for that host.
+
+```python
+await tab.go_to("https://example.com/login")
+await browser.autofill_login(tab)            # submit=True to press Enter after
+```
+
+It fills the first saved login matching the page's host, and isn't meant to
+resolve a page with several accounts.
+
+### Checkpoint / diff a session
+
+See what sites changed over a stretch of browsing:
+
+```python
+import browserprofile as bp
+
+before = await browser.checkpoint()          # live cookies, hashed by default
+await tab.go_to("https://example.com/login")
+await browser.autofill_login(tab, submit=True)
+after = await browser.checkpoint()
+delta = bp.diff_checkpoints(before, after)   # which cookies were added/changed
+```
+
+`checkpoint(secrets=...)` takes the same `hash` / `exclude` / `decrypted` modes as
+browserprofile's CLI.
+
 ## What gets carried over
 
 | Data | How |

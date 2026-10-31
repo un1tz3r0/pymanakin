@@ -74,10 +74,16 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         pass
 
 
+LOGIN_FORM = ("<!doctype html><title>login</title><form>"
+              "<input id=u autocomplete=username>"
+              "<input id=p type=password autocomplete=current-password></form>")
+
+
 @pytest.fixture(scope="module")
 def site(tmp_path_factory):
     root = tmp_path_factory.mktemp("site")
     (root / "index.html").write_text("<!doctype html><title>test</title>")
+    (root / "login.html").write_text(LOGIN_FORM)
     handler = functools.partial(_Handler, directory=str(root))
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -198,3 +204,72 @@ def test_failed_storage_copy_leaves_no_temp_profile(source_profile, monkeypatch)
     with pytest.raises(bp.BrowserProfileError):
         asyncio.run(browser.start())
     assert not created[0].exists()
+
+
+@needs_chrome
+def test_checkpoint_diff_detects_cookie_set_during_session(site, source_profile):
+    async def run():
+        async with ProfiledChrome(source_profile, options=_options(), keyring="BASICTEXT") as browser:
+            tab = await browser.start()
+            await tab.go_to(site)
+            before = await browser.checkpoint()
+            await browser.set_cookies([{"name": "fresh", "value": "v", "url": site, "path": "/"}])
+            after = await browser.checkpoint()
+            return before, after
+
+    before, after = asyncio.run(run())
+    assert before["sources"] == ["pydoll-session"]
+    delta = bp.diff_checkpoints(before, after)["cookies"]
+    assert "fresh" in {row["name"] for row in delta["added"]}
+
+
+@needs_chrome
+def test_checkpoint_secret_modes(site, source_profile):
+    async def run(secrets):
+        async with ProfiledChrome(source_profile, options=_options(), keyring="BASICTEXT") as browser:
+            tab = await browser.start()
+            await tab.go_to(site)
+            return await browser.checkpoint(secrets=secrets)
+
+    def visible_value(checkpoint):
+        return next(r["value"] for r in checkpoint["records"]["cookies"] if r["name"] == "visible")
+
+    assert visible_value(asyncio.run(run("decrypted"))) == "js"
+    assert visible_value(asyncio.run(run("hash"))).startswith("sha256:")
+    assert visible_value(asyncio.run(run("exclude"))) is None
+
+
+@needs_chrome
+def test_autofill_login_fills_matching_form(site, source_profile, monkeypatch):
+    login = bp.Login(url=site, username="alice@example.com", password="pw-synthetic",
+                     date_created=None, browser="chrome", profile="Default")
+    monkeypatch.setattr(pymanakin.chrome.bp, "extract_logins", lambda profile, keyring=None: [login])
+
+    async def run():
+        async with ProfiledChrome(source_profile, options=_options(), keyring="BASICTEXT") as browser:
+            tab = await browser.start()
+            await tab.go_to(f"{site}login.html")
+            filled = await browser.autofill_login(tab)
+            seen = await _evaluate(tab, "JSON.stringify({u:document.getElementById('u').value,"
+                                        "p:document.getElementById('p').value})")
+            return filled, seen
+
+    filled, seen = asyncio.run(run())
+    assert filled is True
+    assert '"u":"alice@example.com"' in seen
+    assert '"p":"pw-synthetic"' in seen
+
+
+@needs_chrome
+def test_autofill_login_no_match_returns_false(site, source_profile, monkeypatch):
+    other = bp.Login(url="https://not-this-host.example", username="x", password="y",
+                     date_created=None, browser="chrome", profile="Default")
+    monkeypatch.setattr(pymanakin.chrome.bp, "extract_logins", lambda profile, keyring=None: [other])
+
+    async def run():
+        async with ProfiledChrome(source_profile, options=_options(), keyring="BASICTEXT") as browser:
+            tab = await browser.start()
+            await tab.go_to(f"{site}login.html")
+            return await browser.autofill_login(tab)
+
+    assert asyncio.run(run()) is False
