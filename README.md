@@ -63,7 +63,7 @@ On a dynamic page, a point in a script often has several possible outcomes. `rac
 arms a set of conditions and returns the first that fires, tearing the rest down:
 
 ```python
-from pymanakin import race, Dom, Gone, Response, Navigation, Predicate
+from pymanakin import race, Dom, Gone, Response, Navigation, Console, Predicate
 
 hit = await race(tab, {
     "results": Dom("#results li"),
@@ -71,27 +71,37 @@ hit = await race(tab, {
     "loaded": Gone(".spinner"),
     "api": Response("/search?", status=200),
     "redirected": Navigation("/login"),
+    "error": Console(level="error"),
     "captcha": Predicate("!!document.querySelector('iframe[src*=captcha]')"),
 }, timeout=10)
 
-if hit.label == "captcha":
-    ...
+if hit.label == "results":
+    print(hit.data["text"])  # the matched element's text
 ```
 
 The leaves:
 
 | Leaf | Fires when | `data` |
 |---|---|---|
-| `Dom(selector, text=…)` | the selector matches (with that text) | the selector |
-| `Gone(selector)` | the selector matches nothing | the selector |
+| `Dom(selector, text=…)` | the selector matches (with that text) | `{selector, tag, text}` of the matched element |
+| `Gone(selector)` | the selector matches nothing | `{selector}` |
 | `Response(url_substring, status=…)` | a network response matches | the URL |
 | `Navigation(url_substring=…)` | the main frame navigates | the new URL |
+| `Console(text=…, level=…)` | a `console` call matches | the message text |
+| `Dialog(type=…)` | a JS dialog opens | the dialog message |
 | `Predicate(js, interval=…)` | a JS expression is truthy | the value |
 
 `Dom` and `Gone` use a `MutationObserver` with a scan on arm (an element already
-present, or already absent, fires at once) and fire once. `Response` and
-`Navigation` ride CDP events and fire on every match. `Predicate` polls and fires
-once. `stream` keeps the conditions armed and yields hits as they arrive:
+present, or already absent, fires at once) and fire once. `Response`,
+`Navigation`, `Console` and `Dialog` ride CDP events and fire on every match.
+`Predicate` polls and fires once.
+
+> **`Dialog` caveat:** an open JavaScript dialog blocks the page *and* CDP until
+> it's handled. `Dialog` only *detects* the dialog — it doesn't dismiss it, so
+> handle it (`Page.handleJavaScriptDialog`) or the session hangs. Arming it logs
+> a warning.
+
+`stream` keeps the conditions armed and yields hits as they arrive:
 
 ```python
 async for hit in stream(tab, {"row": Dom("tr.item"), "done": Dom("#complete")}):

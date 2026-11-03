@@ -4,6 +4,7 @@ import asyncio
 import functools
 import http.server
 import json
+import logging
 import shutil
 import threading
 
@@ -11,7 +12,7 @@ import pytest
 from pydoll.browser.chromium import Chrome
 from pydoll.browser.options import ChromiumOptions
 
-from pymanakin import Dom, Gone, Navigation, Predicate, Response, race, stream
+from pymanakin import Console, Dialog, Dom, Gone, Navigation, Predicate, Response, race, stream
 
 needs_chrome = pytest.mark.skipif(not shutil.which("google-chrome"), reason="needs Chrome")
 
@@ -67,7 +68,8 @@ def test_race_returns_already_present_match():
 
     hit = asyncio.run(_with_tab(body))
     assert hit.label == "present"
-    assert hit.data == "#present"
+    assert hit.data["selector"] == "#present"
+    assert hit.data["tag"] == "div"
 
 
 @needs_chrome
@@ -94,7 +96,9 @@ def test_race_text_filter_ignores_wrong_text():
             "document.body.insertAdjacentHTML('beforeend', '<div class=msg>ready now</div>')")
         return await task
 
-    assert asyncio.run(_with_tab(body)).label == "ok"
+    hit = asyncio.run(_with_tab(body))
+    assert hit.label == "ok"
+    assert hit.data["text"] == "ready now"  # the matched element, not the wrong-text one
 
 
 @needs_chrome
@@ -180,6 +184,60 @@ def test_navigation_fires_on_main_frame(site):
     hit = asyncio.run(_with_site_tab(site, body))
     assert hit.label == "nav"
     assert hit.data.endswith("page2.html")
+
+
+@needs_chrome
+def test_console_fires_on_matching_level():
+    async def body(tab):
+        task = asyncio.create_task(race(tab, {"err": Console(level="error")}, timeout=5))
+        await asyncio.sleep(0.3)  # arm before the message
+        await tab.execute_script("console.log('ignored'); console.error('boom', 42)")
+        return await task
+
+    hit = asyncio.run(_with_tab(body))
+    assert hit.label == "err"
+    assert "boom" in hit.data and "42" in hit.data  # args joined, log ignored
+
+
+class _FakeTab:
+    """Captures the handler a leaf registers, so an event can be replayed without
+    a browser. Used for the Dialog leaf, since a real dialog blocks the page."""
+
+    def __init__(self):
+        self.handler = None
+
+    async def enable_page_events(self):
+        pass
+
+    async def on(self, event_name, handler):
+        self.handler = handler
+        return 1
+
+    async def remove_callback(self, callback_id):
+        pass
+
+
+def test_dialog_matches_and_warns(caplog):
+    leaf = Dialog()
+    tab = _FakeTab()
+    hits = []
+    opening = {"params": {"url": "x", "frameId": "f", "message": "Are you sure?",
+                          "type": "confirm", "hasBrowserHandler": False}}
+
+    async def run():
+        with caplog.at_level(logging.WARNING):
+            await leaf.arm(tab, "dlg", lambda label, data: hits.append((label, data)))
+        await tab.handler(opening)
+
+    asyncio.run(run())
+    assert hits == [("dlg", "Are you sure?")]
+    assert any("blocks the page" in record.message for record in caplog.records)
+
+
+def test_dialog_type_filter():
+    leaf = Dialog(type="prompt")
+    assert leaf._match({"type": "alert", "message": "hi"}) is None
+    assert leaf._match({"type": "prompt", "message": "name?"}) == "name?"
 
 
 @needs_chrome

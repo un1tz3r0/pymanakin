@@ -17,6 +17,10 @@ A condition is a :class:`Leaf`: something that arms itself against a tab, calls
   matches a status, if given). Fires on every match.
 * :class:`Navigation` — the main frame navigating (to a URL substring, if given).
   Fires on every navigation.
+* :class:`Console` — a ``console`` call matching a substring and/or level. Fires
+  on every match.
+* :class:`Dialog` — a JavaScript dialog opening. Fires on every match; note the
+  warning on the class, as an open dialog blocks the page until it is handled.
 * :class:`Predicate` — a JavaScript expression polled until truthy, for anything
   the others don't cover (``window`` state, computed style). Fires once.
 
@@ -103,22 +107,24 @@ async def stream(tab, leaves: dict[str, Leaf]) -> AsyncIterator[Hit]:
             yield await queue.get()
 
 
-# A MutationObserver that reports over window[BINDING]. It runs test() once so an
-# already-satisfied condition fires at arm time, and sets a flag so it fires once
-# and then disconnects.
+# A MutationObserver that reports over window[BINDING]. probe() returns a JSON
+# payload string when the condition holds, or null; it runs once so an
+# already-satisfied condition fires at arm time, and a flag makes it fire once
+# and then disconnect.
 _OBSERVER_INSTALL = """
 (function () {
-  function test() { %(test)s }
-  function fire() {
+  function probe() { %(probe)s }
+  function fire(payload) {
     if (window[%(flag)s]) return;
     window[%(flag)s] = true;
     var obs = window[%(obs)s];
     if (obs) { obs.disconnect(); window[%(obs)s] = null; }
-    window[%(binding)s](%(data)s);
+    window[%(binding)s](payload);
   }
-  if (test()) { fire(); }
+  var hit = probe();
+  if (hit !== null) { fire(hit); }
   else {
-    var o = new MutationObserver(function () { if (test()) fire(); });
+    var o = new MutationObserver(function () { var h = probe(); if (h !== null) fire(h); });
     window[%(obs)s] = o;
     o.observe(document.documentElement,
       { childList: true, subtree: true, attributes: true, characterData: true });
@@ -130,9 +136,10 @@ _OBSERVER_DISCONNECT = "(function(){var o=window[%(obs)s];if(o){o.disconnect();w
 
 
 class _ObserverLeaf:
-    """Base for conditions watching the DOM. Subclasses supply ``_test_js`` (a JS
-    statement block returning a boolean: fire now?) and ``_data_js`` (a JS
-    expression for the payload). The observer reports back over a CDP binding."""
+    """Base for conditions watching the DOM. Subclasses supply ``_probe_js`` (a JS
+    statement block returning a JSON payload string when the condition holds, or
+    ``null``). The observer reports the payload back over a CDP binding, and it is
+    delivered as the hit's ``data`` (a parsed dict)."""
 
     def __init__(self):
         token = uuid.uuid4().hex
@@ -142,10 +149,7 @@ class _ObserverLeaf:
         self._tab = None
         self._callback_id: int | None = None
 
-    def _test_js(self) -> str:
-        raise NotImplementedError
-
-    def _data_js(self) -> str:
+    def _probe_js(self) -> str:
         raise NotImplementedError
 
     async def arm(self, tab, label: str, emit: Emit) -> None:
@@ -156,11 +160,11 @@ class _ObserverLeaf:
         async def on_binding(event):
             params = event["params"]
             if params["name"] == self._binding:
-                emit(label, params["payload"])
+                emit(label, json.loads(params["payload"]))
 
         self._callback_id = await tab.on(RuntimeEvent.BINDING_CALLED, on_binding)
         await tab.execute_script(_OBSERVER_INSTALL % {
-            "test": self._test_js(), "data": self._data_js(),
+            "probe": self._probe_js(),
             "flag": json.dumps(self._flag), "obs": json.dumps(self._obs),
             "binding": json.dumps(self._binding)})
 
@@ -176,95 +180,168 @@ class _ObserverLeaf:
 class Dom(_ObserverLeaf):
     """Fires when ``selector`` matches an element (optionally one containing
     ``text``). Scans once on arm, so an element already on the page fires at once,
-    then fires a single time. ``data`` is the selector."""
+    then fires a single time. ``data`` is ``{"selector", "tag", "text"}`` describing
+    the matched element (its text trimmed and capped)."""
 
     def __init__(self, selector: str, *, text: str | None = None):
         super().__init__()
         self._selector = selector
         self._text = text
 
-    def _test_js(self) -> str:
+    def _probe_js(self) -> str:
         sel, txt = json.dumps(self._selector), json.dumps(self._text)
         return (f"var els = document.querySelectorAll({sel}), txt = {txt};"
-                f"for (var i = 0; i < els.length; i++)"
-                f"{{ if (txt === null || (els[i].textContent || '').indexOf(txt) !== -1) return true; }}"
-                f"return false;")
-
-    def _data_js(self) -> str:
-        return json.dumps(self._selector)
+                f"for (var i = 0; i < els.length; i++) {{ var el = els[i];"
+                f"  if (txt === null || (el.textContent || '').indexOf(txt) !== -1)"
+                f"    return JSON.stringify({{ selector: {sel}, tag: el.tagName.toLowerCase(),"
+                f"      text: (el.textContent || '').trim().slice(0, 200) }}); }}"
+                f"return null;")
 
 
 class Gone(_ObserverLeaf):
     """Fires when ``selector`` matches nothing — e.g. a loading spinner removed.
     If it already matches nothing on arm, fires at once; fires once. ``data`` is
-    the selector."""
+    ``{"selector"}`` (there is no element left to describe)."""
 
     def __init__(self, selector: str):
         super().__init__()
         self._selector = selector
 
-    def _test_js(self) -> str:
-        return f"return document.querySelectorAll({json.dumps(self._selector)}).length === 0;"
-
-    def _data_js(self) -> str:
-        return json.dumps(self._selector)
+    def _probe_js(self) -> str:
+        sel = json.dumps(self._selector)
+        return f"if (document.querySelectorAll({sel}).length === 0) return JSON.stringify({{ selector: {sel} }}); return null;"
 
 
-class Response:
+class _EventLeaf:
+    """Base for conditions riding a CDP event. Subclasses set ``_event`` (the CDP
+    event name) and ``_enable`` (the tab coroutine that turns its domain on), and
+    implement ``_match(params)``, returning the payload to emit or ``None`` to
+    ignore the event."""
+
+    _event: str = ""
+    _enable: str = ""
+
+    def __init__(self):
+        self._tab = None
+        self._callback_id: int | None = None
+
+    def _match(self, params: dict) -> Any | None:
+        raise NotImplementedError
+
+    async def arm(self, tab, label: str, emit: Emit) -> None:
+        self._tab = tab
+        await getattr(tab, self._enable)()
+
+        async def handler(event):
+            data = self._match(event["params"])
+            if data is not None:
+                emit(label, data)
+
+        self._callback_id = await tab.on(self._event, handler)
+
+    async def disarm(self) -> None:
+        if self._callback_id is not None:
+            with contextlib.suppress(Exception):
+                await self._tab.remove_callback(self._callback_id)
+
+
+class Response(_EventLeaf):
     """Fires when a network response's URL contains ``url_substring`` (and matches
     ``status``, if given). ``data`` is the response URL. Fires on every match, and
     enables network events on the tab."""
 
+    _event = NetworkEvent.RESPONSE_RECEIVED
+    _enable = "enable_network_events"
+
     def __init__(self, url_substring: str, *, status: int | None = None):
+        super().__init__()
         self._url = url_substring
         self._status = status
-        self._tab = None
-        self._callback_id: int | None = None
 
-    async def arm(self, tab, label: str, emit: Emit) -> None:
-        self._tab = tab
-        await tab.enable_network_events()
-
-        async def on_response(event):
-            response = event["params"]["response"]
-            if self._url in response["url"] and (self._status is None or response["status"] == self._status):
-                emit(label, response["url"])
-
-        self._callback_id = await tab.on(NetworkEvent.RESPONSE_RECEIVED, on_response)
-
-    async def disarm(self) -> None:
-        if self._callback_id is not None:
-            with contextlib.suppress(Exception):
-                await self._tab.remove_callback(self._callback_id)
+    def _match(self, params):
+        response = params["response"]
+        if self._url in response["url"] and (self._status is None or response["status"] == self._status):
+            return response["url"]
+        return None
 
 
-class Navigation:
+class Navigation(_EventLeaf):
     """Fires when the main frame navigates (to a URL containing ``url_substring``,
     if given). ``data`` is the new URL. Fires on every navigation, and enables
     page events on the tab."""
 
+    _event = PageEvent.FRAME_NAVIGATED
+    _enable = "enable_page_events"
+
     def __init__(self, url_substring: str | None = None):
+        super().__init__()
         self._url = url_substring
-        self._tab = None
-        self._callback_id: int | None = None
+
+    def _match(self, params):
+        frame = params["frame"]
+        if "parentId" in frame:  # a sub-frame, not the page
+            return None
+        if self._url is None or self._url in frame["url"]:
+            return frame["url"]
+        return None
+
+
+def _console_arg(arg: dict) -> str:
+    """One console argument as text: its value, else Chrome's description, else
+    its type (an object logged by reference carries no value)."""
+    if "value" in arg:
+        return str(arg["value"])
+    return str(arg.get("description", arg["type"]))
+
+
+class Console(_EventLeaf):
+    """Fires on a ``console`` call whose joined text contains ``text`` (if given)
+    and whose level matches ``level`` (``"error"``, ``"warning"``, …, if given).
+    ``data`` is the joined message. Fires on every match, and enables runtime
+    events on the tab."""
+
+    _event = RuntimeEvent.CONSOLE_API_CALLED
+    _enable = "enable_runtime_events"
+
+    def __init__(self, text: str | None = None, *, level: str | None = None):
+        super().__init__()
+        self._text = text
+        self._level = level
+
+    def _match(self, params):
+        if self._level is not None and params["type"] != self._level:
+            return None
+        message = " ".join(_console_arg(arg) for arg in params["args"])
+        if self._text is None or self._text in message:
+            return message
+        return None
+
+
+class Dialog(_EventLeaf):
+    """Fires when a JavaScript dialog opens (``alert`` / ``confirm`` / ``prompt`` /
+    ``beforeunload``, or only ``type`` if given). ``data`` is the dialog message.
+
+    Warning: an open dialog blocks the page *and* CDP until it is handled.
+    Detecting it here does not dismiss it — handle it (``Page.handleJavaScriptDialog``)
+    or the session will hang. ``arm`` logs this at WARNING level."""
+
+    _event = PageEvent.JAVASCRIPT_DIALOG_OPENING
+    _enable = "enable_page_events"
+
+    def __init__(self, type: str | None = None):
+        super().__init__()
+        self._type = type
 
     async def arm(self, tab, label: str, emit: Emit) -> None:
-        self._tab = tab
-        await tab.enable_page_events()
+        logger.warning(
+            "Dialog leaf armed (%s): an open JS dialog blocks the page and CDP until handled; "
+            "detecting it does not dismiss it, so handle it or the session may hang.", label)
+        await super().arm(tab, label, emit)
 
-        async def on_navigated(event):
-            frame = event["params"]["frame"]
-            if "parentId" in frame:  # a sub-frame, not the page
-                return
-            if self._url is None or self._url in frame["url"]:
-                emit(label, frame["url"])
-
-        self._callback_id = await tab.on(PageEvent.FRAME_NAVIGATED, on_navigated)
-
-    async def disarm(self) -> None:
-        if self._callback_id is not None:
-            with contextlib.suppress(Exception):
-                await self._tab.remove_callback(self._callback_id)
+    def _match(self, params):
+        if self._type is None or params["type"] == self._type:
+            return params["message"]
+        return None
 
 
 class Predicate:
