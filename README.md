@@ -57,6 +57,51 @@ delta = bp.diff_checkpoints(before, after)   # which cookies were added/changed
 `checkpoint(secrets=...)` takes the same `hash` / `exclude` / `decrypted` modes as
 browserprofile's CLI.
 
+### Racing page conditions
+
+On a dynamic page, a point in a script often has several possible outcomes. `race`
+arms a set of conditions and returns the first that fires, tearing the rest down:
+
+```python
+from pymanakin import race, Dom, Gone, Response, Navigation, Predicate
+
+hit = await race(tab, {
+    "results": Dom("#results li"),
+    "empty": Dom(".no-results", text="Nothing found"),
+    "loaded": Gone(".spinner"),
+    "api": Response("/search?", status=200),
+    "redirected": Navigation("/login"),
+    "captcha": Predicate("!!document.querySelector('iframe[src*=captcha]')"),
+}, timeout=10)
+
+if hit.label == "captcha":
+    ...
+```
+
+The leaves:
+
+| Leaf | Fires when | `data` |
+|---|---|---|
+| `Dom(selector, text=…)` | the selector matches (with that text) | the selector |
+| `Gone(selector)` | the selector matches nothing | the selector |
+| `Response(url_substring, status=…)` | a network response matches | the URL |
+| `Navigation(url_substring=…)` | the main frame navigates | the new URL |
+| `Predicate(js, interval=…)` | a JS expression is truthy | the value |
+
+`Dom` and `Gone` use a `MutationObserver` with a scan on arm (an element already
+present, or already absent, fires at once) and fire once. `Response` and
+`Navigation` ride CDP events and fire on every match. `Predicate` polls and fires
+once. `stream` keeps the conditions armed and yields hits as they arrive:
+
+```python
+async for hit in stream(tab, {"row": Dom("tr.item"), "done": Dom("#complete")}):
+    if hit.label == "done":
+        break
+```
+
+A condition is any object with `arm` / `disarm` (the `Leaf` protocol), so your
+own is a small class away.
+
 ## What gets carried over
 
 | Data | How |
